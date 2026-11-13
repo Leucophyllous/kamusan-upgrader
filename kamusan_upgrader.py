@@ -22,9 +22,11 @@ KamuSan のあるバージョンから別バージョンへ、自作譜面・ス
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as _dt
 import fnmatch
 import hashlib
+import io
 import json
 import os
 import re
@@ -389,6 +391,156 @@ def preflight(old_dir: Path, new_dir: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# 引き継ぎ検証
+#   引き継ぎ元の score_*.csv（ゲームが出力したスコア一覧）と、引き継ぎ先のゲームが
+#   起動時に出力する cdb6.csv（曲ごとの記録）を突き合わせ、記録が反映されているか調べる。
+#   どちらもゲーム自身が出力した CSV を読むだけで、セーブや暗号化データには触れない。
+# ---------------------------------------------------------------------------
+
+# cdb6.csv の曲名の先頭に付く制御文字(0x00-0x1F)。比較のため取り除く
+_CTRL = re.compile("[" + chr(0) + "-" + chr(31) + "]")
+_DB_SCORE_COLS = ("ハイスコア-易", "ハイスコア-普", "ハイスコア-難")
+# score_*.csv では「[EX]曲名」「[CL]曲名」、cdb6.csv では「3曲名」「5曲名」の行になる
+_PREFIX_BY_TAG = {"[EX]": "3", "[CL]": "5"}
+DIFF_TEXT = {1: "BASIC", 2: "ADVANCED", 3: "KAMUSAN", 5: "EX"}
+VERIFY_TEXT = {
+    "ok": "一致",
+    "improved": "先の方が高い",
+    "lower": "先の方が低い",
+    "missing": "曲が無い",
+}
+
+
+@dataclass
+class VerifyRow:
+    source: str  # 元の score CSV のファイル名
+    name: str
+    diff: int
+    score: int
+    status: str  # ok / improved / lower / missing
+    db_score: int = 0
+    note: str = ""
+
+    @property
+    def is_problem(self) -> bool:
+        return self.status in ("lower", "missing")
+
+
+def _read_csv_rows(path: Path) -> list[list[str]]:
+    text = path.read_bytes().decode("utf-8-sig", "replace").replace("<<!--DATANAME--!>>,", "")
+    return list(csv.reader(io.StringIO(text)))
+
+
+def _to_int(v) -> int:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return 0
+
+
+def load_cdb6(game_dir: Path) -> dict[str, dict[str, str]] | None:
+    """cdb6.csv を {曲名(制御文字なし): {列名: 値}} で返す。無ければ None。"""
+    p = game_dir / "cdb6.csv"
+    if not p.is_file():
+        return None
+    rows = _read_csv_rows(p)
+    if not rows:
+        return {}
+    hdr = rows[0]
+    db: dict[str, dict[str, str]] = {}
+    for r in rows[1:]:
+        if r and r[0]:
+            db.setdefault(_CTRL.sub("", r[0]), dict(zip(hdr, r)))
+    return db
+
+
+def load_score_csv(path: Path) -> list[tuple[str, int, int]]:
+    """score_*.csv から (曲名, 難易度, スコア) を読む。見出し行は読み飛ばす。"""
+    out = []
+    for r in _read_csv_rows(path):
+        if len(r) >= 4 and r[1].strip().isdigit():
+            out.append((r[0], int(r[1]), _to_int(r[3])))
+    return out
+
+
+def verify_scores(source: str, scores, db) -> list[VerifyRow]:
+    rows = []
+    for name, diff, score in scores:
+        key, tagged = name, False
+        for tag, prefix in _PREFIX_BY_TAG.items():
+            if name.startswith(tag):
+                key, tagged = prefix + name[len(tag):], True
+                break
+        rec = db.get(key)
+        if rec is None:
+            rows.append(VerifyRow(source, name, diff, score, "missing",
+                                  note="引き継ぎ先の曲一覧に見つかりません（曲名の変更・削除の可能性）"))
+            continue
+        # 通常曲は難易度の欄だけ、EX/CL は欄が決まっていないので3欄すべてを見る
+        cols = _DB_SCORE_COLS if (tagged or diff not in (1, 2, 3)) else (_DB_SCORE_COLS[diff - 1],)
+        vals = [_to_int(rec.get(c)) for c in cols]
+        best = max(vals)
+        if score in vals:
+            status = "ok"
+        elif best > score:
+            status = "improved"
+        else:
+            status = "lower"
+        note = {"improved": "元の書き出し以降に更新された記録と思われます",
+                "lower": "記録が反映されていない可能性があります"}.get(status, "")
+        rows.append(VerifyRow(source, name, diff, score, status, best, note))
+    return rows
+
+
+def run_verify(src_dir: Path, dst_dir: Path) -> tuple[list[VerifyRow], list[str]]:
+    """引き継ぎ元の score_*.csv と、引き継ぎ先の cdb6.csv を突き合わせる。"""
+    notes: list[str] = []
+    db = load_cdb6(dst_dir)
+    if db is None:
+        notes.append("引き継ぎ先に cdb6.csv がありません。引き継ぎ先のゲームを一度起動してから、もう一度実行してください。")
+        return [], notes
+    csvs = sorted(src_dir.glob("score_*.csv"))
+    if not csvs:
+        notes.append("引き継ぎ元に score_*.csv がありません。ゲームの「スコアデータ出力」で書き出したファイルが必要です。")
+        return [], notes
+    stamp = _dt.datetime.fromtimestamp((dst_dir / "cdb6.csv").stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+    notes.append(f"cdb6.csv の更新時刻: {stamp}（曲数 {len(db)}）")
+    rows: list[VerifyRow] = []
+    for p in csvs:
+        rows += verify_scores(p.name, load_score_csv(p), db)
+    if rows and all(r.is_problem for r in rows):
+        notes.append("全件が不一致です。cdb6.csv が別のプレイヤー(Data.1〜3)で起動した内容か、"
+                     "セーブが引き継がれていない可能性があります。score_<名前>.csv と同じプレイヤーを選んで起動してください。")
+    return rows, notes
+
+
+def summarize_verify(rows: list[VerifyRow]) -> str:
+    cnt: dict[str, int] = {}
+    for r in rows:
+        cnt[r.status] = cnt.get(r.status, 0) + 1
+    body = " / ".join(f"{VERIFY_TEXT[k]} {cnt[k]}" for k in VERIFY_TEXT if k in cnt)
+    return f"検証 {len(rows)} 件: {body or 'なし'}"
+
+
+def run_verify_cli(src_dir: Path, dst_dir: Path) -> int:
+    print(f"引き継ぎ元: {src_dir}")
+    print(f"引き継ぎ先: {dst_dir}")
+    rows, notes = run_verify(src_dir, dst_dir)
+    for r in rows:
+        diff = DIFF_TEXT.get(r.diff, str(r.diff))
+        extra = f"  {r.score:>7} → {r.db_score:>7}" if r.status != "missing" else f"  {r.score:>7}"
+        print(f"  {VERIFY_TEXT[r.status]:<8} {r.name} [{diff}]{extra}  {r.note}".rstrip())
+    for n in notes:
+        print("注意:", n)
+    if not rows:
+        return 2
+    print(summarize_verify(rows))
+    problems = sum(r.is_problem for r in rows)
+    print("結果: " + ("問題なし" if problems == 0 else f"要確認 {problems} 件"))
+    return 0 if problems == 0 else 1
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -402,6 +554,8 @@ def _ask(prompt: str) -> str:
 
 
 def run_cli(args) -> int:
+    if args.verify:
+        return run_verify_cli(resolve_game_dir(args.old), resolve_game_dir(args.new))
     if args.restore_latest:
         cands = []
         for d in (args.new, args.old):  # 旧→新・新→旧どちらの引き継ぎでも、直近の退避を探す
@@ -613,6 +767,29 @@ def run_gui() -> int:
         messagebox.showinfo("完了", "引き継ぎが完了しました。\n新しい KamuSan を起動して確認してください。")
         preview()
 
+    def do_verify():
+        try:
+            o, n = resolve_game_dir(old_var.get()), resolve_game_dir(new_var.get())
+        except Exception as e:  # noqa: BLE001
+            messagebox.showerror("エラー", str(e))
+            return
+        rows, notes = run_verify(o, n)
+        tree.delete(*tree.get_children())
+        for r in rows:
+            detail = (f"{r.score} → {r.db_score}" if r.status != "missing" else f"{r.score}")
+            tree.insert("", "end", values=(
+                VERIFY_TEXT[r.status], f"{r.name} [{DIFF_TEXT.get(r.diff, r.diff)}]",
+                f"{detail}  {r.note}".strip()))
+        for note in notes:
+            log("注意: " + note)
+        if rows:
+            problems = sum(r.is_problem for r in rows)
+            summary.config(text=summarize_verify(rows) + ("  → 問題なし" if problems == 0 else f"  → 要確認 {problems} 件"))
+        else:
+            summary.config(text="検証できませんでした（ログを確認してください）")
+        state["plan"] = None
+        run_btn.config(state="disabled")
+
     def do_restore():
         d = filedialog.askdirectory(
             title="退避フォルダ(_upgrade_backup 内の日時フォルダ)を選択",
@@ -632,7 +809,8 @@ def run_gui() -> int:
     ttk.Button(bar, text="1. プレビュー", command=preview).pack(side="left")
     run_btn = ttk.Button(bar, text="2. 引き継ぎ実行", command=do_run, state="disabled")
     run_btn.pack(side="left", padx=6)
-    ttk.Button(bar, text="元に戻す…", command=do_restore).pack(side="left")
+    ttk.Button(bar, text="3. 引き継ぎ検証", command=do_verify).pack(side="left")
+    ttk.Button(bar, text="元に戻す…", command=do_restore).pack(side="left", padx=6)
 
     # 既定: このスクリプトの隣にある「旧KamuSan」「新KamuSan」を自動入力
     here = Path(sys.argv[0]).resolve().parent
@@ -656,6 +834,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-ini", action="store_true", help="Game.ini を引き継がない")
     ap.add_argument("--overwrite-save", action="store_true",
                     help="新版側にセーブがあっても旧版のセーブで上書きする(通常は不要)")
+    ap.add_argument("--verify", action="store_true",
+                    help="引き継ぎ元の score_*.csv と、引き継ぎ先の cdb6.csv を突き合わせて検証する")
     ap.add_argument("--restore", metavar="DIR", help="退避フォルダから引き継ぎ前へ戻す")
     ap.add_argument("--update", choices=["on", "off"],
                     help="自動更新(オンライン通信)を on=許可 / off=停止 にして終了(--new か --auto と併用)")
