@@ -395,7 +395,8 @@ def preflight(old_dir: Path, new_dir: Path) -> list[str]:
 
 def _ask(prompt: str) -> str:
     try:
-        return input(prompt).strip("﻿ \t\r\n").lower()
+        # strip a stray BOM (U+FEFF) and whitespace from the input
+        return input(prompt).strip(chr(0xFEFF) + " \t\r\n").lower()
     except EOFError:
         return ""
 
