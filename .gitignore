@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# ゲーム本体・セーブ・検証用のもの（このリポジトリには含めない）
+旧KamuSan/
+新KamuSan/
+_upgrade_backup/
+verify_shots/
+Game.ini.upgrader_bak
+Game.ini.tmp
